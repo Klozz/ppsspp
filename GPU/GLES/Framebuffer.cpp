@@ -787,7 +787,12 @@ void FramebufferManager::ResizeFramebufFBO(VirtualFramebuffer *vfb, u16 w, u16 h
 	vfb->renderWidth = vfb->bufferWidth * renderWidthFactor;
 	vfb->renderHeight = vfb->bufferHeight * renderHeightFactor;
 
-	if (g_Config.bTrueColor) {
+	bool trueColor = g_Config.bTrueColor;
+	if (hackForce04154000Download_ && vfb->fb_address == 0x00154000) {
+		trueColor = false;
+	}
+
+	if (trueColor) {
 		vfb->colorDepth = FBO_8888;
 	} else {
 		switch (vfb->format) {
@@ -992,7 +997,7 @@ void FramebufferManager::DoSetRenderFrameBuffer() {
 		vfb->last_frame_attached = 0;
 		frameLastFramebufUsed = gpuStats.numFlips;
 		vfbs_.push_back(vfb);
-		glEnable(GL_DITHER);  // why?
+		glDisable(GL_DITHER);  // why?
 		currentRenderVfb_ = vfb;
 
 		u32 byteSize = FramebufferByteSize(vfb);
@@ -1438,7 +1443,7 @@ void FramebufferManager::ReadFramebufferToMemory(VirtualFramebuffer *vfb, bool s
 			nvfb->last_frame_render = gpuStats.numFlips;
 			bvfbs_.push_back(nvfb);
 			ClearBuffer();
-			glEnable(GL_DITHER);
+			glDisable(GL_DITHER);
 		} else {
 			nvfb->usageFlags |= FB_USAGE_RENDERTARGET;
 			textureCache_->ForgetLastTexture();
@@ -1723,6 +1728,13 @@ void FramebufferManager::PackFramebufferAsync_(VirtualFramebuffer *vfb) {
 	bool unbind = false;
 	u8 nextPBO = (currentPBO_ + 1) % MAX_PBO;
 	bool useCPU = g_Config.iRenderingMode == FB_READFBOMEMORY_CPU;
+	// We might get here if hackForce04154000Download_ is hit.
+	// Some cards or drivers seem to always dither when downloading a framebuffer to 16-bit.
+	// This causes glitches in games that expect the exact values.
+	// It has not been experienced on NVIDIA cards, so those are left using the GPU (which is faster.)
+	if (g_Config.iRenderingMode == FB_BUFFERED_MODE && gl_extensions.gpuVendor != GPU_VENDOR_NVIDIA) {
+		useCPU = true;
+	}
 
 	// We'll prepare two PBOs to switch between readying and reading
 	if (!pixelBufObj_) {
@@ -1775,19 +1787,19 @@ void FramebufferManager::PackFramebufferAsync_(VirtualFramebuffer *vfb) {
 				pixelType = (reverseOrder ? GL_UNSIGNED_SHORT_4_4_4_4_REV : GL_UNSIGNED_SHORT_4_4_4_4);
 				pixelFormat = GL_RGBA;
 				pixelSize = 2;
-				align = 8;
+				align = 2;
 				break;
 			case GE_FORMAT_5551: // 16 bit RGBA
 				pixelType = (reverseOrder ? GL_UNSIGNED_SHORT_1_5_5_5_REV : GL_UNSIGNED_SHORT_5_5_5_1);
 				pixelFormat = GL_RGBA;
 				pixelSize = 2;
-				align = 8;
+				align = 2;
 				break;
 			case GE_FORMAT_565: // 16 bit RGB
 				pixelType = (reverseOrder ? GL_UNSIGNED_SHORT_5_6_5_REV : GL_UNSIGNED_SHORT_5_6_5);
 				pixelFormat = GL_RGB;
 				pixelSize = 2;
-				align = 8;
+				align = 2;
 				break;
 			case GE_FORMAT_8888: // 32 bit RGBA
 			default:
@@ -1813,7 +1825,18 @@ void FramebufferManager::PackFramebufferAsync_(VirtualFramebuffer *vfb) {
 			return;
 		}
 
-		if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		GLenum fbStatus;
+#ifndef USING_GLES2
+		if (!gl_extensions.FBO_ARB) {
+			fbStatus = glCheckFramebufferStatusEXT(GL_READ_FRAMEBUFFER);
+		} else {
+			fbStatus = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+		}
+#else
+		fbStatus = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+#endif
+
+		if (fbStatus != GL_FRAMEBUFFER_COMPLETE) {
 			ERROR_LOG(SCEGE, "Incomplete source framebuffer, aborting read");
 			fbo_unbind();
 			if (gl_extensions.FBO_ARB) {
@@ -2044,6 +2067,17 @@ void FramebufferManager::DestroyAllFBOs() {
 		DestroyFramebuf(vfb);
 	}
 	vfbs_.clear();
+
+	for (size_t i = 0; i < bvfbs_.size(); ++i) {
+		VirtualFramebuffer *vfb = bvfbs_[i];
+		DestroyFramebuf(vfb);
+	}
+	bvfbs_.clear();
+
+	for (auto it = tempFBOs_.begin(), end = tempFBOs_.end(); it != end; ++it) {
+		fbo_destroy(it->second.fbo);
+	}
+	tempFBOs_.clear();
 }
 
 void FramebufferManager::UpdateFromMemory(u32 addr, int size, bool safe) {
@@ -2164,7 +2198,7 @@ bool FramebufferManager::NotifyFramebufferCopy(u32 src, u32 dst, int size, bool 
 		}
 		return false;
 	} else if (dstBuffer) {
-		WARN_LOG_REPORT_ONCE(btucpy, G3D, "Memcpy fbo upload %08x -> %08x", src, dst);
+		WARN_LOG_ONCE(btucpy, G3D, "Memcpy fbo upload %08x -> %08x", src, dst);
 		if (g_Config.bBlockTransferGPU) {
 			FlushBeforeCopy();
 			const u8 *srcBase = Memory::GetPointerUnchecked(src);
@@ -2186,7 +2220,7 @@ bool FramebufferManager::NotifyFramebufferCopy(u32 src, u32 dst, int size, bool 
 		}
 		return false;
 	} else if (srcBuffer) {
-		WARN_LOG_REPORT_ONCE(btdcpy, G3D, "Memcpy fbo download %08x -> %08x", src, dst);
+		WARN_LOG_ONCE(btdcpy, G3D, "Memcpy fbo download %08x -> %08x", src, dst);
 		FlushBeforeCopy();
 		if (srcH == 0 || srcY + srcH > srcBuffer->bufferHeight) {
 			WARN_LOG_REPORT_ONCE(btdcpyheight, G3D, "Memcpy fbo download %08x -> %08x skipped, %d+%d is taller than %d", src, dst, srcY, srcH, srcBuffer->bufferHeight);
